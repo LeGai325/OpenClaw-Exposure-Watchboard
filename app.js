@@ -1,6 +1,7 @@
 const PAGE_SIZE = 100;
 const MAX_ROWS_TO_LOAD = 5000;
 const DATA_PATH = 'data/exposure_watchboard_data.csv';
+const LFS_POINTER_SIGNATURE = 'version https://git-lfs.github.com/spec/v1';
 
 const columns = [
   'endpoint',
@@ -36,13 +37,67 @@ let currentPage = 1;
 let isTruncated = false;
 let totalRowsParsed = 0;
 
+function parseRepoFromGitHubPagesLocation() {
+  const host = window.location.hostname;
+  if (!host.endsWith('.github.io')) {
+    return null;
+  }
+
+  const owner = host.replace('.github.io', '');
+  const pathParts = window.location.pathname.split('/').filter(Boolean);
+  const repo = pathParts[0];
+
+  if (!owner || !repo) {
+    return null;
+  }
+
+  return { owner, repo };
+}
+
+async function isGitLFSPointer(response) {
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > 0 && contentLength > 1024) {
+    return false;
+  }
+
+  const text = await response.text();
+  return text.startsWith(LFS_POINTER_SIGNATURE);
+}
+
+async function fetchCSVResponse() {
+  const primary = await fetch(DATA_PATH);
+  if (!primary.ok) {
+    throw new Error(`加载数据失败: ${primary.status}`);
+  }
+
+  if (!(await isGitLFSPointer(primary.clone()))) {
+    return primary;
+  }
+
+  const repoInfo = parseRepoFromGitHubPagesLocation();
+  if (!repoInfo) {
+    throw new Error('检测到 Git LFS 指针文件，当前环境无法直接读取真实数据');
+  }
+
+  const fallbackUrl = `https://media.githubusercontent.com/media/${repoInfo.owner}/${repoInfo.repo}/main/${DATA_PATH}`;
+  const fallback = await fetch(fallbackUrl);
+
+  if (!fallback.ok) {
+    throw new Error(`GitHub Pages 检测到 LFS 指针，回退源加载失败: ${fallback.status}`);
+  }
+
+  return fallback;
+}
+
 function pushRow(rowValues, header, rows, limit) {
   if (!rowValues.some((value) => value !== '')) {
     return;
   }
 
   if (!header.length) {
-    header.push(...rowValues);
+    rowValues.forEach((value, index) => {
+      header.push(index === 0 ? value.replace(/^\uFEFF/, '') : value);
+    });
     return;
   }
 
@@ -113,11 +168,15 @@ async function parseCSVStream(response, limit) {
       await reader.cancel();
       break;
     }
-  }
 
   if (cell || row.length) {
     row.push(cell.trim());
     pushRow(row, header, rows, limit);
+  }
+
+  const hasKnownColumn = header.some((column) => columns.includes(column));
+  if (!hasKnownColumn) {
+    throw new Error('数据表头不匹配，无法渲染表格');
   }
 
   return rows;
@@ -181,13 +240,11 @@ async function init() {
 
   try {
     pageInfo.textContent = '正在加载数据...';
-    const response = await fetch(DATA_PATH);
-    if (!response.ok) {
-      throw new Error(`加载数据失败: ${response.status}`);
-    }
 
     totalRowsParsed = 0;
     isTruncated = false;
+
+    const response = await fetchCSVResponse();
     data = await parseCSVStream(response, MAX_ROWS_TO_LOAD);
     renderRows();
   } catch (error) {
