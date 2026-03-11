@@ -208,9 +208,8 @@ function renderRows() {
   });
 
   const totalPages = Math.max(1, Math.ceil(data.length / PAGE_SIZE));
-  const suffix = isTruncated
-    ? `（数据过大，仅展示前 ${data.length} 条；已解析 ${totalRowsParsed} 条）`
-    : `（总计 ${data.length} 条）`;
+  // 移除了 isTruncated 的复杂判断，直接显示总条数
+  const suffix = `（总计 ${data.length} 条）`;
   pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页${suffix}`;
   prevBtn.disabled = currentPage === 1;
   nextBtn.disabled = currentPage === totalPages;
@@ -233,18 +232,21 @@ function wirePagination() {
   });
 }
 
+
 async function init() {
   renderHeader();
   wirePagination();
 
   try {
-    pageInfo.textContent = '正在加载数据...';
+    // 提示语稍微改一下，因为加载 130MB 数据会比较耗时
+    pageInfo.textContent = '正在加载并解析全部数据，这可能需要几十秒的时间，请耐心等待...';
 
     totalRowsParsed = 0;
     isTruncated = false;
 
     const response = await fetchCSVResponse();
-    data = await parseCSVStream(response, MAX_ROWS_TO_LOAD);
+    // 将原本的 MAX_ROWS_TO_LOAD 替换为 Infinity（无穷大），解除限制
+    data = await parseCSVStream(response, Infinity);
     renderRows();
   } catch (error) {
     pageInfo.textContent = `数据加载失败：${error.message}`;
