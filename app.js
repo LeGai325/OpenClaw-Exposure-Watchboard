@@ -168,7 +168,6 @@ async function parseCSVStream(response, limit) {
       await reader.cancel();
       break;
     }
-  }
 
   if (cell || row.length) {
     row.push(cell.trim());
