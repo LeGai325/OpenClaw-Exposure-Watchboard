@@ -1,5 +1,7 @@
 const PAGE_SIZE = 100;
+const MAX_ROWS_TO_LOAD = 5000;
 const DATA_PATH = 'data/exposure_watchboard_data.csv';
+const LFS_POINTER_SIGNATURE = 'version https://git-lfs.github.com/spec/v1';
 
 const columns = [
   'endpoint',
@@ -32,61 +34,153 @@ const nextBtn = document.getElementById('nextBtn');
 
 let data = [];
 let currentPage = 1;
+let isTruncated = false;
+let totalRowsParsed = 0;
 
-function parseCSV(text) {
+function parseRepoFromGitHubPagesLocation() {
+  const host = window.location.hostname;
+  if (!host.endsWith('.github.io')) {
+    return null;
+  }
+
+  const owner = host.replace('.github.io', '');
+  const pathParts = window.location.pathname.split('/').filter(Boolean);
+  const repo = pathParts[0];
+
+  if (!owner || !repo) {
+    return null;
+  }
+
+  return { owner, repo };
+}
+
+async function isGitLFSPointer(response) {
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > 0 && contentLength > 1024) {
+    return false;
+  }
+
+  const text = await response.text();
+  return text.startsWith(LFS_POINTER_SIGNATURE);
+}
+
+async function fetchCSVResponse() {
+  const primary = await fetch(DATA_PATH);
+  if (!primary.ok) {
+    throw new Error(`加载数据失败: ${primary.status}`);
+  }
+
+  if (!(await isGitLFSPointer(primary.clone()))) {
+    return primary;
+  }
+
+  const repoInfo = parseRepoFromGitHubPagesLocation();
+  if (!repoInfo) {
+    throw new Error('检测到 Git LFS 指针文件，当前环境无法直接读取真实数据');
+  }
+
+  const fallbackUrl = `https://media.githubusercontent.com/media/${repoInfo.owner}/${repoInfo.repo}/main/${DATA_PATH}`;
+  const fallback = await fetch(fallbackUrl);
+
+  if (!fallback.ok) {
+    throw new Error(`GitHub Pages 检测到 LFS 指针，回退源加载失败: ${fallback.status}`);
+  }
+
+  return fallback;
+}
+
+function pushRow(rowValues, header, rows, limit) {
+  if (!rowValues.some((value) => value !== '')) {
+    return;
+  }
+
+  if (!header.length) {
+    rowValues.forEach((value, index) => {
+      header.push(index === 0 ? value.replace(/^\uFEFF/, '') : value);
+    });
+    return;
+  }
+
+  totalRowsParsed += 1;
+  if (rows.length >= limit) {
+    isTruncated = true;
+    return;
+  }
+
+  const item = {};
+  header.forEach((key, index) => {
+    item[key] = rowValues[index] ?? '-';
+  });
+  rows.push(item);
+}
+
+async function parseCSVStream(response, limit) {
+  if (!response.body) {
+    throw new Error('浏览器不支持流式读取');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
   const rows = [];
+  const header = [];
   let row = [];
   let cell = '';
   let inQuotes = false;
 
-  for (let i = 0; i < text.length; i += 1) {
-    const char = text[i];
-    const next = text[i + 1];
+  while (true) {
+    const { value, done } = await reader.read();
+    const chunk = decoder.decode(value || new Uint8Array(), { stream: !done });
 
-    if (char === '"') {
-      if (inQuotes && next === '"') {
-        cell += '"';
-        i += 1;
+    for (let i = 0; i < chunk.length; i += 1) {
+      const char = chunk[i];
+      const next = chunk[i + 1];
+
+      if (char === '"') {
+        if (inQuotes && next === '"') {
+          cell += '"';
+          i += 1;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (char === ',' && !inQuotes) {
+        row.push(cell.trim());
+        cell = '';
+      } else if ((char === '\n' || char === '\r') && !inQuotes) {
+        if (char === '\r' && next === '\n') {
+          i += 1;
+        }
+
+        row.push(cell.trim());
+        cell = '';
+        pushRow(row, header, rows, limit);
+        row = [];
       } else {
-        inQuotes = !inQuotes;
+        cell += char;
       }
-    } else if (char === ',' && !inQuotes) {
-      row.push(cell.trim());
-      cell = '';
-    } else if ((char === '\n' || char === '\r') && !inQuotes) {
-      if (char === '\r' && next === '\n') {
-        i += 1;
-      }
-      row.push(cell.trim());
-      cell = '';
-      if (row.some((value) => value !== '')) {
-        rows.push(row);
-      }
-      row = [];
-    } else {
-      cell += char;
+    }
+
+    if (done) {
+      break;
+    }
+
+    if (rows.length >= limit) {
+      isTruncated = true;
+      await reader.cancel();
+      break;
     }
   }
 
   if (cell || row.length) {
     row.push(cell.trim());
-    if (row.some((value) => value !== '')) {
-      rows.push(row);
-    }
+    pushRow(row, header, rows, limit);
   }
 
-  if (rows.length === 0) {
-    return [];
+  const hasKnownColumn = header.some((column) => columns.includes(column));
+  if (!hasKnownColumn) {
+    throw new Error('数据表头不匹配，无法渲染表格');
   }
 
-  const header = rows[0];
-  return rows.slice(1).map((values) => {
-    const item = {};
-    header.forEach((key, index) => {
-      item[key] = values[index] ?? '-';
-    });
-    return item;
-  });
+  return rows;
 }
 
 function renderHeader() {
@@ -116,7 +210,10 @@ function renderRows() {
   });
 
   const totalPages = Math.max(1, Math.ceil(data.length / PAGE_SIZE));
-  pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页（总计 ${data.length} 条）`;
+  const suffix = isTruncated
+    ? `（数据过大，仅展示前 ${data.length} 条；已解析 ${totalRowsParsed} 条）`
+    : `（总计 ${data.length} 条）`;
+  pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页${suffix}`;
   prevBtn.disabled = currentPage === 1;
   nextBtn.disabled = currentPage === totalPages;
 }
@@ -143,12 +240,13 @@ async function init() {
   wirePagination();
 
   try {
-    const response = await fetch(DATA_PATH);
-    if (!response.ok) {
-      throw new Error(`加载数据失败: ${response.status}`);
-    }
-    const csvText = await response.text();
-    data = parseCSV(csvText);
+    pageInfo.textContent = '正在加载数据...';
+
+    totalRowsParsed = 0;
+    isTruncated = false;
+
+    const response = await fetchCSVResponse();
+    data = await parseCSVStream(response, MAX_ROWS_TO_LOAD);
     renderRows();
   } catch (error) {
     pageInfo.textContent = `数据加载失败：${error.message}`;
