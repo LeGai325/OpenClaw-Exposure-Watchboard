@@ -55,13 +55,9 @@ function parseRepoFromGitHubPagesLocation() {
 }
 
 async function isGitLFSPointer(response) {
-  const contentLength = Number(response.headers.get('content-length') || 0);
-  if (contentLength > 0 && contentLength > 1024) {
-    return false;
-  }
-
+  // 放弃严格的 content-length 检查，改用更稳健的 includes 判断
   const text = await response.text();
-  return text.startsWith(LFS_POINTER_SIGNATURE);
+  return text.includes('git-lfs.github.com/spec/v1');
 }
 
 async function fetchCSVResponse() {
@@ -70,13 +66,15 @@ async function fetchCSVResponse() {
     throw new Error(`加载数据失败: ${primary.status}`);
   }
 
+  // 使用 clone() 避免消耗掉原始流
   if (!(await isGitLFSPointer(primary.clone()))) {
     return primary;
   }
 
+  // --- 确认为 LFS 指针文件后的回退逻辑 ---
   const repoInfo = parseRepoFromGitHubPagesLocation();
   if (!repoInfo) {
-    throw new Error('检测到 Git LFS 指针文件，当前环境无法直接读取真实数据');
+    throw new Error('检测到 Git LFS 指针文件，但当前不在 GitHub Pages 环境。如果您在本地测试，请先运行 git lfs pull');
   }
 
   const fallbackUrl = `https://media.githubusercontent.com/media/${repoInfo.owner}/${repoInfo.repo}/main/${DATA_PATH}`;
@@ -168,6 +166,7 @@ async function parseCSVStream(response, limit) {
       await reader.cancel();
       break;
     }
+  } // 修复：这里之前缺失了一个右大括号
 
   if (cell || row.length) {
     row.push(cell.trim());
